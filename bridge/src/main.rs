@@ -79,11 +79,11 @@ struct PromptRequest {
 /// command line always wins over the file, matching standard dotenv
 /// semantics. Missing file is fine (most deployments won't have one — e.g.
 /// CI, or a real provider configured via ~/.loop/agent/ instead).
-fn load_dotenv() {
+fn load_dotenv() -> anyhow::Result<()> {
     let Ok(contents) = std::fs::read_to_string(".env") else {
-        return;
+        return Ok(());
     };
-    for line in contents.lines() {
+    for (idx, line) in contents.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -92,6 +92,17 @@ fn load_dotenv() {
             continue;
         };
         let key = key.trim();
+        if let Some(embedded) = embedded_assignment(value) {
+            anyhow::bail!(
+                ".env line {}: the value of {key} contains another assignment \
+                 ({embedded}=...), so several settings were merged onto one line \
+                 and none of them will be read correctly. This usually happens \
+                 when a block of config lines is pasted into a single-value \
+                 prompt or appended without line breaks. Put each KEY=VALUE on \
+                 its own line (see .env.example).",
+                idx + 1
+            );
+        }
         // Strip one layer of matching quotes, e.g. FOO="bar baz" — plain
         // KEY=VALUE with no quoting works fine without this.
         let value = value.trim();
@@ -104,6 +115,31 @@ fn load_dotenv() {
             std::env::set_var(key, value);
         }
     }
+    Ok(())
+}
+
+/// Returns the variable name if `value` contains what looks like a second
+/// `NAME_LIKE_THIS=` assignment — i.e. several settings glued onto one line.
+/// Only underscore-containing ALL-CAPS names count, so ordinary values
+/// (URLs with `?a=b`, base64 padding like `abc==`) never trip it.
+fn embedded_assignment(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'=' {
+            continue;
+        }
+        let start = value[..i]
+            .rfind(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .map_or(0, |p| p + 1);
+        let name = &value[start..i];
+        if name.len() >= 4
+            && name.contains('_')
+            && name.starts_with(|c: char| c.is_ascii_uppercase())
+        {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// Refuses to boot with an unrecognized provider instead of letting it
@@ -165,7 +201,7 @@ fn validate_provider_registered(configured_provider: Option<&str>) -> anyhow::Re
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    load_dotenv();
+    load_dotenv()?;
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

@@ -25,6 +25,61 @@ set -m
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# --- validation for the setup prompts below ---------------------------------
+# The provider prompt used to accept any text into a hidden "Paste your API
+# key" field. People pasted the whole config block (LOOP_SERVER_PROVIDER=...)
+# there, it was saved as SOKET_API_KEY=LOOP_SERVER_PROVIDER=..., and because
+# the field is hidden nobody saw it happen — the bridge then booted with no
+# provider and a garbage key, and every message failed with a confusing 401.
+# Every prompt now checks what it got and says why it refused.
+looks_like_pasted_config() {
+	# Whitespace, or a second NAME_LIKE_THIS= assignment, means this isn't a
+	# single value at all.
+	case "$1" in *[[:space:]]*) return 0 ;; esac
+	printf '%s' "$1" | grep -Eq '[A-Z][A-Z0-9]*_[A-Z0-9_]+='
+}
+# A multi-line paste leaves its remaining lines in the terminal's input
+# buffer, where the next prompt would silently consume them.
+drain_stdin() { while IFS= read -r -t 1 -s _drain 2>/dev/null; do :; done; }
+
+ask_secret() { # $1 = variable to set, $2 = prompt text
+	local v
+	while true; do
+		read -r -s -p "$2" v
+		echo
+		if [ -z "$v" ]; then
+			echo "    Nothing entered — try again (Ctrl+C to quit)."
+			continue
+		fi
+		if looks_like_pasted_config "$v"; then
+			drain_stdin
+			echo "    That looks like config text (KEY=VALUE lines), not a key. Paste only the"
+			echo "    key itself, not the variable name. Nothing was saved."
+			continue
+		fi
+		if [ "${#v}" -lt 8 ]; then
+			echo "    That's only ${#v} characters — too short to be an API key. Try again."
+			continue
+		fi
+		echo "    Got ${#v} characters, starting with '${v:0:3}'."
+		printf -v "$1" '%s' "$v"
+		return 0
+	done
+}
+
+ask_field() { # $1 = variable to set, $2 = prompt text, $3 = ERE it must match, $4 = what's expected
+	local v
+	while true; do
+		read -r -p "$2" v
+		if [ -n "$v" ] && printf '%s' "$v" | grep -Eq "$3"; then
+			printf -v "$1" '%s' "$v"
+			return 0
+		fi
+		drain_stdin
+		echo "    Expected $4 — try again (Ctrl+C to quit)."
+	done
+}
+
 if [ ! -f .env ]; then
 	cp .env.example .env
 	echo "==> Created .env from .env.example (first run)."
@@ -64,16 +119,11 @@ if ! grep -qE '^LOOP_SERVER_PROVIDER=' .env 2>/dev/null; then
 			return 0
 		}
 		if [ "$provider_choice" = "1" ]; then
-			read -r -s -p "    Paste your API key: " api_key
-			echo
-			if [ -n "$api_key" ]; then
-				ensure_trailing_newline
-				echo "SOKET_API_KEY=${api_key}" >>.env
-				echo "==> Saved to .env."
-			else
-				echo "error: no key entered — nothing saved. Add one to .env manually and re-run." >&2
-				exit 1
-			fi
+			echo "    Paste ONLY the key itself (nothing shows while you type or paste)."
+			ask_secret api_key "    API key: "
+			ensure_trailing_newline
+			echo "SOKET_API_KEY=${api_key}" >>.env
+			echo "==> Saved to .env."
 		elif [ "$provider_choice" = "2" ]; then
 			# A custom provider needs *two* things registered, not just a key in
 			# .env: (1) LOOP_SERVER_PROVIDER/MODEL + the key, here in .env, and
@@ -87,16 +137,12 @@ if ! grep -qE '^LOOP_SERVER_PROVIDER=' .env 2>/dev/null; then
 			# actually checks. Doing both together here, in one guided step,
 			# is the whole point of this branch.
 			echo
-			read -r -p "    Provider id (e.g. tensorstudio-litellm): " custom_id
-			read -r -p "    Base URL (e.g. https://api.tensorstudio.ai/v1): " custom_url
-			read -r -p "    Model id (e.g. qwen3-8-27b): " custom_model
-			read -r -p "    Env var name for its key (e.g. TENSORSTUDIO_LITELLM_KEY): " custom_key_env
-			read -r -s -p "    Paste the actual key value: " custom_key_value
-			echo
-			if [ -z "$custom_id" ] || [ -z "$custom_url" ] || [ -z "$custom_model" ] || [ -z "$custom_key_env" ] || [ -z "$custom_key_value" ]; then
-				echo "error: all five fields are required — nothing saved. Re-run and fill in each one." >&2
-				exit 1
-			fi
+			ask_field custom_id "    Provider id (e.g. tensorstudio-litellm): " '^[A-Za-z0-9._-]+$' "letters, digits, . _ - only (a short name, no spaces or '=')"
+			ask_field custom_url "    Base URL (e.g. https://api.tensorstudio.ai/v1): " '^https?://[^[:space:]]+$' "a URL starting with http:// or https://"
+			ask_field custom_model "    Model id (e.g. qwen3-8-27b): " '^[^[:space:]=]+$' "a single model id with no spaces or '='"
+			ask_field custom_key_env "    Env var name for its key (e.g. TENSORSTUDIO_LITELLM_KEY): " '^[A-Z][A-Z0-9_]*$' "an UPPER_CASE variable name (the name only, not the key)"
+			echo "    Paste ONLY the key itself (nothing shows while you type or paste)."
+			ask_secret custom_key_value "    Key value: "
 			if ! command -v python3 >/dev/null 2>&1; then
 				echo "error: python3 not found — needed to safely edit models.json as JSON." >&2
 				echo "       Add this manually to ~/.loop/agent/models.json's \"providers\" array instead:" >&2
@@ -143,6 +189,19 @@ PYEOF
 		fi
 		echo
 	fi
+fi
+
+# Catches a .env that's already malformed (settings merged onto one line by a
+# bad paste or an append without a line break) before anything is built —
+# the bridge refuses to boot on the same condition, but failing here is
+# faster and names the exact line.
+merged_lines="$(grep -nE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=.*[A-Z][A-Z0-9]*_[A-Z0-9_]+=' .env 2>/dev/null || true)"
+if [ -n "$merged_lines" ]; then
+	echo "error: .env has line(s) with several settings merged into one:" >&2
+	echo "$merged_lines" | sed -E 's/^([0-9]+):([A-Za-z_][A-Za-z0-9_]*)=.*/       line \1: value of \2 contains another KEY=.../' >&2
+	echo "       Each KEY=VALUE must be on its own line (see .env.example). Fix or delete" >&2
+	echo "       those lines and re-run — nothing was built or started." >&2
+	exit 1
 fi
 
 echo "==> Using config from .env"
