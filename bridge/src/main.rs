@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 use loop_agent::harness::{AgentHarness, AgentHarnessPhase, HostExecutionEnv};
 use loop_agent::{AgentEvent, AgentTool, AgentToolResult};
 use loop_app_core::runtime::{bootstrap, BootstrapOpts};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 /// Broadcast capacity: comfortably more than one turn's worth of events
 /// (start/text_delta-per-chunk/.../done plus Loop's own lifecycle wrapper
@@ -64,6 +64,10 @@ struct AppState {
     /// same existing access through a browser panel, not a new category
     /// of it.
     files_root: PathBuf,
+    /// Browser origins allowed to talk to this bridge (same list the CORS
+    /// layer uses), or `["*"]` for any. Kept in state because WebSockets
+    /// are *not* subject to CORS — see `origin_allowed` and `terminal_ws`.
+    allowed_origins: Arc<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -83,6 +87,10 @@ fn load_dotenv() {
     let Ok(contents) = std::fs::read_to_string(".env") else {
         return;
     };
+    // Windows editors (Notepad) save UTF-8 with a BOM, which would otherwise
+    // glue itself onto the first key and silently break that one variable.
+    // (`lines()` already copes with CRLF endings.)
+    let contents = contents.trim_start_matches('\u{feff}');
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -104,6 +112,72 @@ fn load_dotenv() {
             std::env::set_var(key, value);
         }
     }
+}
+
+/// Parses `LOOP_SERVER_CORS_ORIGIN` into the list of allowed browser origins:
+/// comma-separated, trailing slashes ignored, defaulting to the Vite dev
+/// server. A `localhost` origin also allows its `127.0.0.1` twin (and vice
+/// versa) — same machine, same port, but browsers treat them as different
+/// origins, so opening the app via the "other" name used to fail with a
+/// bare "Failed to fetch". `*` on its own means any origin.
+fn parse_allowed_origins(raw: Option<String>) -> Vec<String> {
+    let raw = raw.unwrap_or_else(|| "http://localhost:5173".to_string());
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |o: String| {
+        if !out.contains(&o) {
+            out.push(o);
+        }
+    };
+    for origin in raw.split(',').map(|o| o.trim().trim_end_matches('/')).filter(|o| !o.is_empty()) {
+        if origin == "*" {
+            return vec!["*".to_string()];
+        }
+        push(origin.to_string());
+        for (from, to) in [("://localhost", "://127.0.0.1"), ("://127.0.0.1", "://localhost")] {
+            if let Some((scheme, rest)) = origin.split_once(from) {
+                // Only swap when the host is exactly localhost/127.0.0.1
+                // (followed by ':port' or nothing), not e.g. localhost.evil.com.
+                if rest.is_empty() || rest.starts_with(':') {
+                    push(format!("{scheme}{to}{rest}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether a request's `Origin` header is allowed. A missing header means a
+/// non-browser client (curl, scripts) — browsers always send one on
+/// WebSocket handshakes — so it's let through, same as CORS never applying
+/// to curl.
+fn origin_allowed(allowed: &[String], headers: &HeaderMap) -> bool {
+    if allowed.iter().any(|o| o == "*") {
+        return true;
+    }
+    match headers.get(header::ORIGIN) {
+        None => true,
+        Some(v) => v.to_str().map(|o| allowed.iter().any(|a| a == o)).unwrap_or(false),
+    }
+}
+
+/// The shell for the terminal panel: `$SHELL` if it points at something real,
+/// otherwise the first common shell that exists (minimal containers and
+/// stripped-down accounts often have no `$SHELL` and no `/bin/bash`).
+fn default_shell() -> String {
+    if let Ok(s) = std::env::var("SHELL") {
+        if !s.is_empty() && (!s.contains('/') || Path::new(&s).exists()) {
+            return s;
+        }
+    }
+    if cfg!(windows) {
+        return std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    }
+    for candidate in ["/bin/bash", "/bin/zsh", "/bin/sh"] {
+        if Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+    "/bin/sh".to_string()
 }
 
 /// Refuses to boot with an unrecognized provider instead of letting it
@@ -309,29 +383,38 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let allowed_origins = parse_allowed_origins(std::env::var("LOOP_SERVER_CORS_ORIGIN").ok());
+
     let state = AppState {
         harness: runtime.harness,
         events_tx,
         cwd,
         files_root: PathBuf::from("/"),
+        allowed_origins: Arc::new(allowed_origins.clone()),
     };
 
-    // CORS origin defaults to the Vite dev server this bridge was built
-    // against. Override with LOOP_SERVER_CORS_ORIGIN for a different
-    // frontend origin, or set it to "*" to allow any origin (fine for a
-    // throwaway local demo; never do this once this bridge is reachable
-    // from anywhere but your own machine — it holds no auth of its own).
-    let cors_origin =
-        std::env::var("LOOP_SERVER_CORS_ORIGIN").unwrap_or_else(|_| "http://localhost:5173".to_string());
-    let cors = if cors_origin == "*" {
+    // Allowed frontend origin(s) default to the Vite dev server this bridge
+    // was built against (localhost and 127.0.0.1 both). Override with
+    // LOOP_SERVER_CORS_ORIGIN (comma-separated for several), or set it to "*"
+    // to allow any origin (fine for a throwaway local demo; never do this
+    // once this bridge is reachable from anywhere but your own machine — it
+    // holds no auth of its own).
+    let cors = if allowed_origins.iter().any(|o| o == "*") {
         tracing::warn!("LOOP_SERVER_CORS_ORIGIN=* — allowing any origin; fine for a local demo only");
         CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)
     } else {
-        let origin: HeaderValue = cors_origin
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid LOOP_SERVER_CORS_ORIGIN {cors_origin:?}: {e}"))?;
-        tracing::info!("CORS restricted to origin {cors_origin}");
-        CorsLayer::new().allow_origin(origin).allow_methods(Any).allow_headers(Any)
+        let origins = allowed_origins
+            .iter()
+            .map(|o| {
+                o.parse::<HeaderValue>()
+                    .map_err(|e| anyhow::anyhow!("invalid LOOP_SERVER_CORS_ORIGIN entry {o:?}: {e}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        tracing::info!("CORS restricted to origins {allowed_origins:?}");
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods(Any)
+            .allow_headers(Any)
     };
 
     let app = Router::new()
@@ -825,8 +908,20 @@ struct ResizeMsg {
 /// the PTY is blocking (portable-pty's API, not tokio's), so both run on
 /// dedicated OS threads bridged to the async socket via channels rather
 /// than blocking the runtime.
-async fn terminal_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+async fn terminal_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    // CORS does not apply to WebSockets: without this check, any web page
+    // open in the user's browser could connect to ws://127.0.0.1:8787 and
+    // get an interactive shell on their machine.
+    if !origin_allowed(&state.allowed_origins, &headers) {
+        tracing::warn!("rejected /terminal/ws from disallowed origin {:?}", headers.get(header::ORIGIN));
+        return StatusCode::FORBIDDEN.into_response();
+    }
     ws.on_upgrade(move |socket| handle_terminal_socket(socket, state.cwd.clone()))
+        .into_response()
 }
 
 async fn handle_terminal_socket(mut socket: WebSocket, cwd: PathBuf) {
@@ -844,7 +939,7 @@ async fn handle_terminal_socket(mut socket: WebSocket, cwd: PathBuf) {
         }
     };
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let shell = default_shell();
     let mut cmd = CommandBuilder::new(&shell);
     cmd.cwd(&cwd);
 
@@ -1100,4 +1195,48 @@ fn build_rag_query_tool() -> AgentTool {
             Ok(AgentToolResult::text(body.to_string()))
         },
     )
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    #[test]
+    fn default_allows_both_loopback_names() {
+        assert_eq!(
+            parse_allowed_origins(None),
+            vec!["http://localhost:5173", "http://127.0.0.1:5173"]
+        );
+    }
+
+    #[test]
+    fn custom_origins_are_split_trimmed_and_aliased() {
+        let got = parse_allowed_origins(Some("http://127.0.0.1:3000/ , https://x-5173.app.github.dev".into()));
+        assert_eq!(
+            got,
+            vec!["http://127.0.0.1:3000", "http://localhost:3000", "https://x-5173.app.github.dev"]
+        );
+    }
+
+    #[test]
+    fn lookalike_hosts_are_not_aliased() {
+        let got = parse_allowed_origins(Some("http://localhost.evil.com".into()));
+        assert_eq!(got, vec!["http://localhost.evil.com"]);
+    }
+
+    #[test]
+    fn wildcard_wins() {
+        assert_eq!(parse_allowed_origins(Some("http://a.com, *".into())), vec!["*"]);
+    }
+
+    #[test]
+    fn websocket_origin_check() {
+        let allowed = parse_allowed_origins(None);
+        let mut h = HeaderMap::new();
+        assert!(origin_allowed(&allowed, &h), "no Origin header = non-browser client");
+        h.insert(header::ORIGIN, "http://127.0.0.1:5173".parse().unwrap());
+        assert!(origin_allowed(&allowed, &h));
+        h.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        assert!(!origin_allowed(&allowed, &h));
+    }
 }

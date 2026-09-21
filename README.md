@@ -4,6 +4,23 @@ A browser chat UI for [Loop](https://github.com/soketlabs/loop)'s
 `AgentHarness` — the same stateful agent the `loop` TUI uses, exposed
 instead over HTTP/SSE/WebSocket to a web frontend.
 
+## Requirements
+
+`./scripts/dev.sh` checks all of these up front and tells you what's missing:
+
+| Need | Version | Notes |
+|---|---|---|
+| **macOS or Linux** (or **WSL2** on Windows) | — | Native Windows shells (Git Bash/MSYS) are untested; use WSL2 |
+| **Rust** (`cargo`) | 1.85+ | The script offers to install it via rustup; if it's older: `rustup update stable` |
+| **C compiler / linker** | — | macOS: `xcode-select --install` · Debian/Ubuntu: `sudo apt install build-essential` |
+| **git** | any | cargo fetches the harness from GitHub |
+| **Node.js** | 20.19+ or 22.12+ | 22 LTS recommended (Vite 7's requirement) |
+| **Free ports** | 5173 (web), 8787 (bridge) | Change via `LOOP_SERVER_CORS_ORIGIN` / `LOOP_SERVER_PORT` in `.env` |
+
+The first build compiles the harness and takes a few minutes.
+
+Open the app at `http://localhost:5173` or `http://127.0.0.1:5173` — both work.
+
 ## Quick start
 
 **1. Clone and configure:**

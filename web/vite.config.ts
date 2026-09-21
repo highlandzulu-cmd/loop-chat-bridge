@@ -5,6 +5,10 @@ export default defineConfig({
 	plugins: [tailwindcss()],
 	server: {
 		port: 5173,
+		// Fail loudly if 5173 is taken instead of silently hopping to 5174,
+		// which the bridge's CORS allow-list doesn't cover — that used to show
+		// up as a baffling "Failed to fetch" on every request.
+		strictPort: true,
 	},
 	// pi-web-ui's PDF attachment handling sets up the pdfjs-dist worker via
 	// `new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url)`.

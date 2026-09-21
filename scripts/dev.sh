@@ -25,6 +25,65 @@ set -m
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+BIN_EXT=""
+case "$(uname -s 2>/dev/null)" in
+MINGW* | MSYS* | CYGWIN*)
+	echo "warning: native Windows shells (Git Bash/MSYS/Cygwin) are untested here." >&2
+	echo "         If anything below fails, use WSL2 (Ubuntu) instead." >&2
+	BIN_EXT=".exe"
+	;;
+Darwin)
+	if ! xcode-select -p >/dev/null 2>&1; then
+		echo "error: Xcode command line tools are missing (Rust needs a linker)." >&2
+		echo "       Run: xcode-select --install   then re-run this script." >&2
+		exit 1
+	fi
+	;;
+Linux)
+	if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+		echo "error: no C compiler/linker found (Rust needs one)." >&2
+		echo "       Debian/Ubuntu: sudo apt install build-essential   Fedora: sudo dnf groupinstall 'Development Tools'" >&2
+		exit 1
+	fi
+	;;
+esac
+if ! command -v git >/dev/null 2>&1; then
+	echo "error: git not found — cargo needs it to fetch the loop harness dependency." >&2
+	exit 1
+fi
+
+# Read a setting the same way the bridge does: a real env var wins, else the
+# first matching KEY=VALUE line in .env. dev.sh used to look only at the
+# shell environment, so values set in .env (the documented place) were
+# ignored by the port checks and URLs below.
+dotenv_get() {
+	local key="$1" val
+	val="${!key:-}"
+	if [ -z "$val" ] && [ -f .env ]; then
+		val="$(grep -E "^[[:space:]]*${key}=" .env 2>/dev/null | head -n1 | tr -d '\r' | sed -E "s/^[^=]*=//; s/^[\"']//; s/[\"']\$//")" || true
+	fi
+	printf '%s' "$val"
+}
+
+# Is something already listening on this TCP port? lsof isn't installed on
+# many minimal Linux setups, so fall back to a bash /dev/tcp probe.
+port_in_use() {
+	if command -v lsof >/dev/null 2>&1; then
+		lsof -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+	else
+		(exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+	fi
+}
+
+# Prompts below need a real terminal; without one, `read` hits EOF and
+# `set -e` exits with no explanation.
+require_tty() {
+	if [ ! -t 0 ]; then
+		echo "error: $1 — and there's no terminal to ask you. Run this from an interactive shell." >&2
+		exit 1
+	fi
+}
+
 if [ ! -f .env ]; then
 	cp .env.example .env
 	echo "==> Created .env from .env.example (first run)."
@@ -53,6 +112,7 @@ if ! grep -qE '^LOOP_SERVER_PROVIDER=' .env 2>/dev/null; then
 		echo "    2) I want to set up a different provider (e.g. TensorStudio LiteLLM, Ollama)"
 		echo "    3) I've already set this up manually — skip (I edited .env / models.json myself)"
 		echo
+		require_tty "no model provider is configured"
 		read -r -p "    Choice [1/2/3]: " provider_choice
 		# .env not ending in a newline before an append merges the new line onto
 		# the end of the last existing one instead of starting a fresh one — hit
@@ -150,6 +210,7 @@ echo "==> Using config from .env"
 if ! command -v cargo >/dev/null 2>&1; then
 	echo
 	echo "==> Rust isn't installed (no 'cargo' on PATH) — this bridge needs it to build."
+	require_tty "cargo isn't installed"
 	read -r -p "    Install it now via rustup.rs? [y/N]: " install_rust
 	if [ "$install_rust" = "y" ] || [ "$install_rust" = "Y" ]; then
 		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -167,14 +228,31 @@ if ! command -v cargo >/dev/null 2>&1; then
 		exit 1
 	fi
 fi
-if ! command -v npm >/dev/null 2>&1; then
-	echo "error: npm not found — install Node.js first." >&2
+
+need_rust_minor="$(sed -nE 's/^rust-version *= *"1\.([0-9]+).*/\1/p' Cargo.toml | head -n1)" || true
+have_rust_minor="$(rustc --version 2>/dev/null | sed -nE 's/^rustc 1\.([0-9]+).*/\1/p')" || true
+if [ -n "$need_rust_minor" ] && [ -n "$have_rust_minor" ] && [ "$have_rust_minor" -lt "$need_rust_minor" ]; then
+	echo "error: Rust 1.${need_rust_minor}+ required, found $(rustc --version)." >&2
+	echo "       Update with: rustup update stable" >&2
+	exit 1
+fi
+
+if ! command -v npm >/dev/null 2>&1 || ! command -v node >/dev/null 2>&1; then
+	echo "error: node/npm not found — install Node.js 22 LTS (https://nodejs.org) first." >&2
+	exit 1
+fi
+# Vite 7 (web/package.json) needs Node ^20.19 or >=22.12; older versions
+# fail with a cryptic syntax/engine error after the slow Rust build.
+node_ok="$(node -e 'const [a,b]=process.versions.node.split(".").map(Number);console.log(a>22||(a===22&&b>=12)||(a===20&&b>=19)?"ok":"old")')"
+if [ "$node_ok" != "ok" ]; then
+	echo "error: Node $(node -v) is too old — need 20.19+ or 22.12+ (22 LTS recommended)." >&2
 	exit 1
 fi
 
 if [ ! -d web/node_modules ]; then
 	echo "==> Installing web/ dependencies (first run only)..."
-	(cd web && npm install)
+	# `npm ci` installs exactly what package-lock.json pins.
+	(cd web && { npm ci || npm install; })
 fi
 
 # The frontend origin the bridge will allow — must match wherever Vite
@@ -184,7 +262,10 @@ fi
 # browser with a generic, hard-to-diagnose "Failed to fetch" — CORS
 # blocking a cross-origin request, not a real crash anywhere. Catching it
 # here, with a clear message, beats debugging that after the fact.
-WEB_PORT="${LOOP_SERVER_CORS_ORIGIN:-}"
+BRIDGE_PORT="$(dotenv_get LOOP_SERVER_PORT)"
+BRIDGE_PORT="${BRIDGE_PORT:-8787}"
+WEB_PORT="$(dotenv_get LOOP_SERVER_CORS_ORIGIN)"
+WEB_PORT="${WEB_PORT%%,*}"
 WEB_PORT="${WEB_PORT##*:}"
 # Falls back to 5173 both when unset (the normal case) and when it's not a
 # plain number at all — e.g. once the Codespaces block below rewrites this
@@ -195,12 +276,15 @@ WEB_PORT="${WEB_PORT##*:}"
 case "$WEB_PORT" in
 '' | *[!0-9]*) WEB_PORT=5173 ;;
 esac
-if lsof -i ":${WEB_PORT}" >/dev/null 2>&1; then
+if port_in_use "$WEB_PORT"; then
 	echo "error: port ${WEB_PORT} is already in use by something else." >&2
-	echo "       Vite would silently move to a different port, which breaks CORS" >&2
-	echo "       against this bridge. Free port ${WEB_PORT} first (lsof -i :${WEB_PORT}" >&2
-	echo "       to see what's using it), or set LOOP_SERVER_CORS_ORIGIN in .env to" >&2
-	echo "       match whatever port you actually want to use." >&2
+	echo "       Free it first (lsof -iTCP:${WEB_PORT} -sTCP:LISTEN shows what's using it)," >&2
+	echo "       or set LOOP_SERVER_CORS_ORIGIN in .env to match a different port." >&2
+	exit 1
+fi
+if port_in_use "$BRIDGE_PORT"; then
+	echo "error: port ${BRIDGE_PORT} (the bridge) is already in use — possibly a previous" >&2
+	echo "       run of this script that didn't shut down. Free it, or set LOOP_SERVER_PORT in .env." >&2
 	exit 1
 fi
 
@@ -215,7 +299,7 @@ fi
 # automatically — enough to construct both forwarding URLs ourselves,
 # every run, with no manual step at all.
 if [ -n "${CODESPACE_NAME:-}" ] && [ -n "${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-}" ]; then
-	FORWARDED_BRIDGE_URL="https://${CODESPACE_NAME}-${LOOP_SERVER_PORT:-8787}.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}"
+	FORWARDED_BRIDGE_URL="https://${CODESPACE_NAME}-${BRIDGE_PORT}.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}"
 	FORWARDED_WEB_URL="https://${CODESPACE_NAME}-${WEB_PORT}.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}"
 
 	echo "==> Detected GitHub Codespaces — using forwarded URLs instead of localhost:"
@@ -247,7 +331,11 @@ if [ -n "${CODESPACE_NAME:-}" ] && [ -n "${GITHUB_CODESPACES_PORT_FORWARDING_DOM
 	echo
 fi
 
-echo "==> Building loop-server..."
+# Pin the target dir so the binary path below is always right — a global
+# `build.target-dir` in ~/.cargo/config.toml or a CARGO_TARGET_DIR export
+# would otherwise put it somewhere other than ./target.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+echo "==> Building loop-server (first build takes a few minutes)..."
 cargo build -p loop-server
 
 # Track both child PIDs so a single Ctrl+C tears down the whole stack —
@@ -257,32 +345,67 @@ PIDS=()
 cleanup() {
 	echo
 	echo "==> Shutting down..."
-	for pid in "${PIDS[@]}"; do
+	# ${arr[@]+...} form: bash 3.2 (macOS default) errors on an empty array under set -u.
+	for pid in ${PIDS[@]+"${PIDS[@]}"}; do
 		# Negative PID = signal the whole process group, not just this one
 		# process — see the `set -m` comment above for why that matters here.
 		kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
 	done
 	wait 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
-echo "==> Starting loop-server on http://127.0.0.1:${LOOP_SERVER_PORT:-8787}..."
+echo "==> Starting loop-server on http://127.0.0.1:${BRIDGE_PORT}..."
 # RUST_LOG defaults to showing nothing at all — which looks identical to a
 # hang or a crash from a blank terminal. Default to "info" here (unless the
-# caller already set RUST_LOG) so the real boot sequence (booting
-# AgentHarness / registered N tools / harness ready) is actually visible,
-# not silent.
-RUST_LOG="${RUST_LOG:-info}" ./target/debug/loop-server &
+# caller already set RUST_LOG) so the real boot sequence is visible.
+RUST_LOG="${RUST_LOG:-info}" "$CARGO_TARGET_DIR/debug/loop-server${BIN_EXT}" &
+BRIDGE_PID=$!
+PIDS+=($BRIDGE_PID)
+
+# Wait until the bridge actually answers /health (up to 60s) instead of a
+# fixed sleep — on a slow machine it can take longer than a second to boot,
+# and if it exits (bad provider config, etc.) fail right here with its log
+# above rather than serving a UI that can never connect.
+if command -v curl >/dev/null 2>&1; then
+	ready=0
+	for _ in $(seq 1 120); do
+		if curl -fsS "http://127.0.0.1:${BRIDGE_PORT}/health" >/dev/null 2>&1; then
+			ready=1
+			break
+		fi
+		if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+			echo "error: loop-server exited during startup — see its output above." >&2
+			exit 1
+		fi
+		sleep 0.5
+	done
+	if [ "$ready" != "1" ]; then
+		echo "error: loop-server didn't answer /health within 60s — see its output above." >&2
+		exit 1
+	fi
+else
+	sleep 3
+fi
+
+# If the bridge port isn't the default and the frontend wasn't told where it
+# is, tell it — otherwise the UI keeps calling 8787 and every request fails.
+if [ -z "${VITE_LOOP_SERVER_URL:-}" ] && ! grep -qE '^VITE_LOOP_SERVER_URL=' web/.env 2>/dev/null; then
+	export VITE_LOOP_SERVER_URL="http://127.0.0.1:${BRIDGE_PORT}"
+fi
+
+echo "==> Starting web frontend on http://localhost:${WEB_PORT}..."
+(cd web && exec npm run dev -- --port "$WEB_PORT" --strictPort) &
 PIDS+=($!)
 
-# Give loop-server a moment to bind before the frontend's first request —
-# cosmetic only (the frontend just shows an error on first send and works
-# fine on retry if this races), but avoids a confusing failed-request log
-# line right at startup.
-sleep 1
-
-echo "==> Starting web frontend on http://localhost:5173..."
-(cd web && npm run dev) &
-PIDS+=($!)
-
-wait
+# Stop everything if either process dies, rather than leaving a half-dead stack.
+while :; do
+	for pid in "${PIDS[@]}"; do
+		if ! kill -0 "$pid" 2>/dev/null; then
+			echo "error: a child process (pid $pid) exited — shutting down." >&2
+			exit 1
+		fi
+	done
+	sleep 1
+done
