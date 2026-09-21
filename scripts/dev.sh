@@ -67,10 +67,15 @@ ask_secret() { # $1 = variable to set, $2 = prompt text
 	done
 }
 
-ask_field() { # $1 = variable to set, $2 = prompt text, $3 = ERE it must match, $4 = what's expected
-	local v
+ask_field() { # $1 = variable, $2 = prompt label, $3 = ERE it must match, $4 = what's expected, $5 = optional default (Enter accepts it)
+	local v default="${5:-}"
 	while true; do
-		read -r -p "$2" v
+		if [ -n "$default" ]; then
+			read -r -p "$2 [$default]: " v
+			v="${v:-$default}"
+		else
+			read -r -p "$2: " v
+		fi
 		if [ -n "$v" ] && printf '%s' "$v" | grep -Eq "$3"; then
 			printf -v "$1" '%s' "$v"
 			return 0
@@ -137,10 +142,12 @@ if ! grep -qE '^LOOP_SERVER_PROVIDER=' .env 2>/dev/null; then
 			# actually checks. Doing both together here, in one guided step,
 			# is the whole point of this branch.
 			echo
-			ask_field custom_id "    Provider id (e.g. tensorstudio-litellm): " '^[A-Za-z0-9._-]+$' "letters, digits, . _ - only (a short name, no spaces or '=')"
-			ask_field custom_url "    Base URL (e.g. https://api.tensorstudio.ai/v1): " '^https?://[^[:space:]]+$' "a URL starting with http:// or https://"
-			ask_field custom_model "    Model id (e.g. qwen3-8-27b): " '^[^[:space:]=]+$' "a single model id with no spaces or '='"
-			ask_field custom_key_env "    Env var name for its key (e.g. TENSORSTUDIO_LITELLM_KEY): " '^[A-Z][A-Z0-9_]*$' "an UPPER_CASE variable name (the name only, not the key)"
+			echo "    Press Enter to accept the [bracketed] defaults — they're the TensorStudio"
+			echo "    LiteLLM setup verified to work. Only the key itself has no default."
+			ask_field custom_id "    Provider id" '^[A-Za-z0-9._-]+$' "letters, digits, . _ - only (a short name, no spaces or '=')" "tensorstudio-litellm"
+			ask_field custom_url "    Base URL" '^https?://[^[:space:]]+$' "a URL starting with http:// or https://" "https://api.tensorstudio.ai/v1"
+			ask_field custom_model "    Model id" '^[^[:space:]=]+$' "a single model id with no spaces or '='" "qwen3-8-27b"
+			ask_field custom_key_env "    Env var name for its key" '^[A-Z][A-Z0-9_]*$' "an UPPER_CASE variable name (the name only, not the key)" "TENSORSTUDIO_LITELLM_KEY"
 			echo "    Paste ONLY the key itself (nothing shows while you type or paste)."
 			ask_secret custom_key_value "    Key value: "
 			if ! command -v python3 >/dev/null 2>&1; then
